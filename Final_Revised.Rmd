@@ -1,0 +1,1404 @@
+---
+title: "Bitcoin Price Forecasting Using Time Series Models"
+date: "March 9, 2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(quantmod)
+library(zoo)
+library(xts)
+library(tseries)
+library(forecast)
+library(FinTS)
+library(rugarch)
+library(vars)
+library(MTS)
+library(tidyverse)
+library(reshape2)
+library(bsts)
+library(PerformanceAnalytics) 
+library(scales)                
+library(fredr)
+```
+
+
+
+# Problem Statement
+
+## Objective
+
+Bitcoin (BTC) is the world's largest cryptocurrency by market capitalization and
+is known for extreme price volatility — daily swings of 5–15% are common. 
+Accurately forecasting BTC's daily price (or returns) would enable traders and 
+portfolio managers to identify entry/exit opportunities and better manage risk.
+
+This project asks: 
+**Can the inclusion of macroeconomic indicators, market indices, and volatility dynamics  improve Bitcoin forecasts compared to a univariate time-series baseline?**
+
+## Research Questions
+
+1. Does BTC exhibit ARCH/GARCH effects, indicating volatility clustering? If so,
+does a VAR-GARCH model forecast BTC better than BSTS or SARIMA, which do not 
+explicitly model conditional volatility?
+
+2. Do macroeconomic and market variables—SPY, QQQ, Fed Funds, the 10-Year 
+Treasury yield, CPI, and unemployment—Granger-cause BTC returns? If so, do 
+multivariate models such as VAR and BSTS improve forecast accuracy relative to a
+univariate SARIMA benchmark?
+
+3. Does a BSTS model with regressors, trend, and seasonality outperform a VAR 
+model in forecasting BTC?
+
+4. Does a rolling VAR model with GARCH, which adds both time-varying volatility 
+modeling and parameter re-estimation relative to the static VAR, lower forecast
+error?
+
+## Scope
+
+- **Target variable:** Daily BTC/USD closing price (log-transformed) and log-returns
+- **Forecast horizon:** January 2026 onward (rolling 1-step-ahead for VAR/GARCH; direct horizon for SARIMA/BSTS)
+- **Training window:** January 2016 – June 2025
+- **Testing window:** June 2025 - January 2026
+
+
+
+# Assumptions and Hypotheses
+
+## Modeling Assumptions
+
+1. **Log-returns for GARCH/VAR:** Raw prices are 
+non-stationary (unit-root), so we work with log-returns 
+`r_t = log(P_t / P_{t-1}) × 100` for volatility and multivariate models.
+   
+2. **Log-prices for SARIMA/BSTS:** Log-prices preserve the interpretation of the 
+series in level terms while helping stabilize variance. In SARIMA, stationarity
+is achieved through explicit differencing specified in the model (the d 
+parameter), while BSTS models nonstationary behavior through latent components 
+such as trend and seasonal states rather than explicit differencing.
+   
+3. **Stationarity after differencing:** We assume one round of log-differencing 
+is sufficient to induce stationarity in all series. This is verified empirically
+via ADF and KPSS tests.
+   
+4. **Data Frequency Alignment:** Lower-frequency series—such as CPI and UNRATE 
+(monthly) and DGS10 and DFF (weekdays only)—are aligned to a daily frequency 
+using forward-filling, with backward-filling applied when no prior value is 
+available. This assumes that the most recent observed value remains in effect 
+until a new release is available, which is a standard approach when integrating 
+macroeconomic data with higher-frequency financial series.
+   
+5. **Constant model parameters over the training window:** VAR and GARCH 
+parameters are assumed stable. Given the 10-year window includes crypto bull and
+bear cycles, this is a simplifying assumption.
+
+## Hypotheses
+
+- **H1 (ARCH effect):** BTC returns exhibit significant ARCH effects due to 
+volatility clustering (e.g., news-driven spikes). Therefore, a VAR+GARCH model 
+is expected to outperform a standard VAR model by explicitly modeling 
+time-varying volatility.
+- **H2 (Macro linkage):** At least one macroeconomic or market variable 
+Granger-causes BTC returns, suggesting that BTC is influenced by broader 
+financial conditions. Therefore, multivariate models that incorporate these 
+variables, such as VAR and BSTS, are expected to outperform a univariate SARIMA 
+model.
+- **H3 (Static VAR vs Rolling VAR+GARCH):** A rolling VAR+GARCH forecast, which 
+adds both time-varying volatility modeling and parameter re-estimation relative
+to the static VAR, will produce lower forecast error.
+- **H4 (BSTS flexibility):** Because BSTS jointly models latent trend, 
+seasonality, and regression effects, it is expected to provide competitive 
+forecasts of BTC log-prices relative to the other approaches.
+
+
+# Data
+
+## Data Sources
+
+```{r data-fetch}
+# Entire Dataset Start and End Date
+start_date <- as.Date("2016-01-01")
+end_date <- as.Date("2026-01-01")
+
+# Test Set Start Date
+test_start <- as.Date("2025-06-01")
+
+# ── Set your FRED API key ──────────────────────────────────────────────────────
+# Get a free key at: https://fred.stlouisfed.org/docs/api/api_key.html
+# Then replace the string below, or set it via:
+#   usethis::edit_r_environ()  and add  FRED_API_KEY=your_key_here
+fredr_set_key("32232ec8ba8f84fd7d9e8c535a0f04c9")
+
+# ── Helper: fredr tibble → xts ────────────────────────────────────────────────
+fredr_to_xts <- function(series_id, col_name, start = start_date, end = end_date) {
+  df <- fredr(series_id     = series_id,
+              observation_start = start,
+              observation_end = end,
+              frequency     = NULL)   # keep native frequency
+  x <- xts(df$value, order.by = as.Date(df$date))
+  colnames(x) <- col_name
+  x
+}
+
+# ── Crypto & Equity (quantmod / Yahoo — unchanged) ───────────────────────────
+getSymbols("BTC-USD", src = "yahoo", from = start_date, to = end_date)
+btc <- Ad(`BTC-USD`); colnames(btc) <- "BTC"
+
+getSymbols("SPY", src = "yahoo", from = start_date, to = end_date)
+spy <- Ad(SPY); colnames(spy) <- "SPY"
+
+getSymbols("QQQ", src = "yahoo", from = start_date, to = end_date)
+qqq <- Ad(QQQ); colnames(qqq) <- "QQQ"
+
+# ── Macro (fredr) ─────────────────────────────────────────────────────────────
+fed    <- fredr_to_xts("DFF",      "FedFunds")   # Fed Funds Rate (daily)
+dgs10  <- fredr_to_xts("DGS10",   "DGS10")       # 10-yr Treasury (daily weekdays)
+cpi    <- fredr_to_xts("CPIAUCSL","CPI")          # CPI (monthly)
+unrate <- fredr_to_xts("UNRATE",  "Unemployment") # Unemployment rate (monthly)
+```
+
+**Variable descriptions:**
+
+| Variable       | Source       | Frequency        | Description |
+|----------------|--------------|------------------|-------------|
+| BTC-USD        | Yahoo        | Daily            | Bitcoin adjusted closing price |
+| SPY            | Yahoo        | Daily            | S&P 500 ETF (broad US equity) |
+| QQQ            | Yahoo        | Daily            | Nasdaq-100 ETF (tech equity) |
+| DFF            | FRED (fredr) | Daily            | Effective Federal Funds Rate |
+| DGS10          | FRED (fredr) | Daily (weekdays) | 10-Year Treasury Constant Maturity |
+| CPIAUCSL       | FRED (fredr) | Monthly          | Consumer Price Index (all urban consumers) |
+| UNRATE         | FRED (fredr) | Monthly          | US Civilian Unemployment Rate |
+
+## Data Merging and Imputation
+
+```{r data-merge}
+# Merge all series
+daily_data <- merge(btc, spy, qqq, fed, dgs10, cpi, unrate)
+
+# Restrict to start date
+daily_data <- daily_data[index(daily_data) >= start_date]
+
+# Expand to full calendar (including weekends / holidays)
+full_dates <- seq(from = min(index(daily_data)),
+                  to   = max(index(daily_data)),
+                  by   = "day")
+
+daily_data <- merge(daily_data, xts(order.by = full_dates), fill = NA)
+
+# Forward fill (carry last known value forward)
+daily_data <- na.locf(daily_data, na.rm = FALSE)
+
+# Backward fill for any leading NAs at the start
+daily_data <- na.locf(daily_data, fromLast = TRUE)
+
+cat("Dataset dimensions:", dim(daily_data), "\n")
+cat("Date range:", as.character(start(daily_data)), "to", as.character(end(daily_data)), "\n")
+```
+
+**Imputation rationale:** Markets for BTC trade 24/7 but SPY/QQQ do not trade on 
+weekends and US holidays. Macro series (CPI, UNRATE) are released monthly. 
+Forward-fill is used because the last observed value is the best available 
+estimate until a new release or trading day. No linear interpolation is used to 
+avoid look-ahead bias.
+
+
+# Data Properties and Exploratory Data Analysis (EDA)
+
+```{r eda-function}
+# EDA function: summary stats + level plot + returns plot + QQ + ACF/PACF + stationarity tests
+eda <- function(x, name, arch_lags = 12) {
+  cat("===== EDA:", name, "=====\n")
+
+  x_num <- as.numeric(x)
+  x_num <- x_num[is.finite(x_num)]
+
+  print(summary(x_num))
+  cat("Mean:     ", round(mean(x_num, na.rm = TRUE), 4), "\n")
+  cat("SD:       ", round(sd(x_num, na.rm = TRUE), 4), "\n")
+  cat("Skewness: ", round(PerformanceAnalytics::skewness(x_num, na.rm = TRUE), 4),
+      " (>0 = right tail, <0 = left tail)\n")
+  cat("Kurtosis: ", round(PerformanceAnalytics::kurtosis(x_num, na.rm = TRUE), 4),
+      " (>3 = heavy tails relative to normal)\n")
+
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+  par(mfrow = c(2, 2))
+
+  # Level plot
+  plot.ts(x_num,
+          main = paste(name, "— Time Series"),
+          col = "steelblue", lwd = 1.2,
+          xlab = "Time", ylab = name)
+
+  # QQ plot
+  qqnorm(x_num, main = paste("QQ Plot:", name))
+  qqline(x_num, col = "red", lwd = 2)
+
+  # ACF/PACF
+  Acf(x_num, main = paste("ACF —", name), lag.max = 40)
+  Pacf(x_num, main = paste("PACF —", name), lag.max = 40)
+
+  par(mfrow = c(1, 1))
+
+  cat("\nADF Test (H0: unit root):\n")
+  print(adf.test(x_num))
+
+  cat("\nKPSS Test (H0: stationary):\n")
+  print(kpss.test(x_num))
+  
+  cat("\nARCH LM Test (H0: no ARCH effects):\n")
+  print(FinTS::ArchTest(x_num, lags = arch_lags))
+  cat("\n")
+}
+```
+
+## Target Variable: BTC Log-Returns and Log-Price
+
+```{r log-btc-returns}
+# Compute log-returns (%)
+btc_ret <- diff(log(daily_data$BTC)) * 100
+btc_ret <- na.omit(btc_ret)
+```
+
+```{r log-btc-price}
+# Compute log-price
+btc_log <- log(daily_data$BTC)
+btc_log <- na.omit(btc_log)
+```
+
+```{r eda-btc-log-returns}
+eda(btc_ret, "BTC Log-Returns (%)")
+```
+
+**Interpretation:** BTC log-returns have a small positive mean return (0.146%) 
+but substantial volatility (SD = 3.53%), with the distribution showing negative 
+skewness (−0.67) and very high kurtosis (12.25), indicating that large negative 
+shocks and extreme movements occur more often than under normality. This is also
+evident in the QQ plot, where both tails deviate notably from the reference
+line, confirming a heavy-tailed, non-normal distribution. The time-series plot
+suggests volatility clustering, with calm periods followed by turbulent periods,
+which is consistent with conditional heteroskedasticity and supports the use of 
+GARCH-type models. At the same time, the ACF and PACF of returns show only weak 
+serial correlation at most lags, implying limited linear dependence in the mean 
+process. Furthermore, the stationarity tests agree that BTC log-returns are 
+stationary: the ADF test rejects the unit root null, while the KPSS test fails 
+to reject stationarity, making the series suitable for return-based models such 
+as ARMA, VAR, and GARCH. Finally, the ARCH LM test strongly rejects the null 
+hypothesis of no ARCH effects indicating significant volatility clustering and 
+supporting the use of GARCH-type models to capture time-varying variance in BTC 
+returns.
+
+```{r eda-btc-log-price}
+eda(btc_log, "BTC Log-Price")
+```
+
+**Interpretation:**
+BTC log-price shows a strong upward trend over time, reflecting the long-term 
+growth of the asset, with values ranging from about 5.90 to 11.73 and an average
+of 9.50. The distribution is slightly negatively skewed (−0.68), indicating 
+somewhat more mass in the upper range of prices relative to the lower range, 
+while the kurtosis (−0.39) suggests lighter tails compared with a normal 
+distribution, which is typical for trending level series rather than returns. 
+The QQ plot confirms deviations from normality, particularly due to the trend 
+structure in the data. The ACF displays very high persistence across many lags,
+while the PACF shows a large spike at the first lag followed by near-zero 
+values, both of which are characteristic of a nonstationary time series with a 
+stochastic trend. The formal stationarity tests support this: the ADF test fails
+to reject the unit root null (p = 0.485), and the KPSS test rejects the null of
+stationarity (p = 0.01). Together, these results indicate that BTC log-price is 
+nonstationary and likely contains a unit root, meaning differencing or 
+state-space trend modeling (e.g., SARIMA differencing or BSTS trend components) 
+is required before forecasting.Finally, the ARCH LM test strongly rejects the 
+null hypothesis of no ARCH effects indicating significant volatility clustering 
+and supporting the use of GARCH-type models to capture time-varying variance in 
+BTC price.
+
+## Correlation Structure
+
+```{r correlation-heatmap}
+# Build dataframe for correlation analysis
+pBTC_c <- log(daily_data$BTC)
+rBTC_c <- diff(log(daily_data$BTC)) * 100
+rSPY_c <- diff(log(daily_data$SPY)) * 100
+rQQQ_c <- diff(log(daily_data$QQQ)) * 100
+dFF_c  <- diff(daily_data$FedFunds)
+dGS10_c <- diff(daily_data$DGS10)
+dCPI_c  <- diff(log(daily_data$CPI)) * 100
+dUNR_c  <- diff(daily_data$Unemployment)
+
+corr_df <- na.omit(data.frame(
+  pBTC = pBTC_c,
+  rBTC = rBTC_c,
+  rSPY = rSPY_c,
+  rQQQ = rQQQ_c,
+  dFF = dFF_c,
+  dGS10 = dGS10_c,
+  dCPI = dCPI_c,
+  dUNR = dUNR_c
+))
+
+cor_mat <- cor(corr_df)
+
+# Melt for ggplot heatmap
+cor_long <- reshape2::melt(cor_mat)
+
+ggplot(cor_long, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 3) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "tomato",
+                       midpoint = 0, limits = c(-1, 1)) +
+  theme_minimal() +
+  labs(title = "Pearson Correlation — Log BTC + Return/Change Series",
+       x = "", y = "", fill = "Corr")
+```
+
+**Key observations:** The correlation matrix shows that BTC returns have 
+moderate positive correlations with equity market returns, particularly SPY and 
+QQQ (≈0.24), suggesting that BTC sometimes moves with broader risk assets. As 
+expected, SPY and QQQ are extremely highly correlated (≈0.93) because both 
+represent large-cap U.S. equities with heavy overlap in holdings. In contrast, 
+correlations between BTC returns and macroeconomic variables such as Fed Funds, 
+the 10-year Treasury yield (DGS10), CPI changes, and unemployment changes are 
+very close to zero, indicating little contemporaneous linear relationship. The 
+BTC log-price itself also shows near-zero correlations with these differenced 
+macro variables, which is consistent with the fact that the macro series 
+represent changes while BTC log-price is a level series. Overall, the heatmap
+suggests that BTC is more connected to equity market movements than to short-run 
+macroeconomic fluctuations, though the relationships remain relatively weak 
+outside of the equity indices.
+
+
+# Data Processing
+
+## Anomaly Detection
+
+```{r anomaly-detection-log-btc-returns}
+# Flag extreme BTC return observations (beyond 3 SD)
+mu  <- mean(btc_ret, na.rm = TRUE)
+sig <- sd(btc_ret, na.rm = TRUE)
+
+outliers <- btc_ret[abs(btc_ret - mu) > 3 * sig]
+
+cat("Observations beyond ±3σ:", length(outliers), "\n")
+cat("Dates of extreme moves:\n")
+print(head(outliers, 20))
+
+# Plot with outlier threshold
+plot(as.numeric(btc_ret),
+     type = "l",
+     main = "BTC Log-Returns — Outlier Detection (±3σ)",
+     col = "steelblue",
+     lwd = 0.8)
+
+abline(h = c(mu + 3*sig, mu - 3*sig),
+       col = "red",
+       lty = 2,
+       lwd = 2)
+
+legend("topright",
+       legend = "±3σ threshold",
+       col = "red",
+       lty = 2,
+       lwd = 2)
+```
+
+**Decision:** The analysis identifies 65 observations beyond the ±3σ threshold, 
+indicating the presence of extreme outliers in BTC returns. However, these 
+observations are retained because, in financial time series, large price 
+movements typically reflect genuine market events—such as regulatory 
+announcements, liquidity shocks, exchange failures, or sudden shifts in investor
+sentiment—rather than data errors. Removing them would distort the true 
+distribution of returns and understate the volatility and risk inherent in the 
+asset. Their presence is consistent with the heavy-tailed behavior observed in 
+the EDA, and the Student-t distribution used in the GARCH model is specifically
+designed to accommodate such extreme observations.
+
+## Missing Value Summary
+
+```{r missing-summary}
+na_counts <- colSums(is.na(daily_data))
+cat("Missing values per series AFTER imputation:\n")
+print(na_counts)
+```
+
+
+# Feature Engineering
+
+## Stationary Transformations
+
+```{r feature-engineering}
+# All series transformed to stationarity before modeling
+pBTC  <- log(daily_data$BTC)
+rBTC  <- diff(log(daily_data$BTC))   * 100   # log-return (%)
+rSPY  <- diff(log(daily_data$SPY))   * 100   # log-return (%)
+rQQQ  <- diff(log(daily_data$QQQ))   * 100   # log-return (%)
+dFF   <- diff(daily_data$FedFunds)           # 1st-diff of rate level
+dGS10 <- diff(daily_data$DGS10)              # 1st-diff of rate level
+dCPI  <- diff(log(daily_data$CPI))   * 100   # log-return (%)
+dUNR  <- diff(daily_data$Unemployment)       # 1st-diff of rate level
+
+var_df <- na.omit(merge(pBTC, rBTC, rSPY, rQQQ, dFF, dGS10, dCPI, dUNR))
+colnames(var_df) <- c("pBTC", "rBTC","rSPY","rQQQ","dFF","dGS10","dCPI","dUNR")
+
+cat("Feature matrix dimensions:", dim(var_df), "\n")
+head(var_df)
+```
+
+**Feature engineering rationale:**
+
+| Raw Variable | Transformation | Reason |
+|-------------|---------------|--------|
+| BTC | Log | Preserves the level-series interpretation for price modeling while helping stabilize variance |
+| BTC, SPY, QQQ prices; CPIAUCSL | Log-difference × 100 | Converts prices and the CPI index into percentage changes, helping remove trend/nonstationarity and making the transformed series easier to compare across variables |
+| DFF, DGS10, UNRATE | First difference | Converts levels into changes, which are more likely to be stationary than the original series |
+
+## EDA of Regressors
+
+```{r eda_spy}
+# EDA for SPY
+eda(rSPY,  "SPY Log-Returns (%)")
+```
+
+```{r eda_qqq}
+# EDA for QQQ
+eda(rQQQ,  "QQQ Log-Returns (%)")
+```
+
+```{r eda_ff}
+# EDA for FF
+eda(dFF,   "Fed Funds Change")
+```
+
+```{r eda_gs10}
+# EDA for GS10
+eda(dGS10, "10-Year Treasury Change")
+```
+
+```{r eda_cpi}
+# EDA for CPI
+eda(dCPI,  "Inflation (Log-Diff %)")
+```
+
+```{r eda_unr}
+# EDA for UNR
+eda(dUNR,  "Unemployment Change")
+```
+
+**Interpretation:** The equity return series (rSPY and rQQQ) strongly reject the
+unit root null in the ADF test and fail to reject stationarity in the KPSS test,
+confirming that the log-return transformation successfully removes 
+nonstationarity. Similar results hold for the macroeconomic variables after 
+differencing or log-differencing: ADF tests reject the presence of a unit root 
+while KPSS tests generally support stationarity, suggesting the transformations
+effectively remove persistent trends.
+
+## Train / Test Split
+
+```{r train-test-split}
+train_xts <- var_df[index(var_df) < test_start]
+train_xts <- train_xts[, colnames(train_xts) != "pBTC"]
+
+test_xts  <- var_df[index(var_df) >= test_start]
+test_xts  <- test_xts[, colnames(test_xts) != "pBTC"]
+
+cat("Train range:", as.character(start(index(train_xts))),
+    "to", as.character(end(index(train_xts))), "\n")
+cat("Train size:", nrow(train_xts), "observations\n")
+cat("Test  range:", as.character(start(index(test_xts))),
+    "to", as.character(end(index(test_xts))), "\n")
+cat("Test  size:", nrow(test_xts), "observations\n")
+
+train_Y <- as.matrix(train_xts)
+test_Y  <- as.matrix(test_xts)
+```
+
+**Note:** The test set (June 2025 onward) is a true hold-out; no model is tuned 
+on test data. The rolling 1-step-ahead evaluation in the VAR+GARCH section 
+re-estimates the model at each step using only data available up to that point 
+— eliminating look-ahead bias.
+
+
+# Proposed Models
+
+This section presents four models in order of complexity. Each is justified by 
+both theoretical motivation and empirical diagnostics.
+
+## Model 1: ARMA — Baseline Mean Model
+
+The ARMA baseline tests whether BTC returns contain any linear autocorrelation 
+structure in their **mean**. It serves as the mean equation for the GARCH model.
+
+```{r arma-fit}
+arma_fit <- auto.arima(as.numeric(btc_ret),
+                       d = 0,
+                       stationary = TRUE,
+                       seasonal   = FALSE,
+                       max.p = 3, max.q = 3)
+
+cat("Selected ARMA order:", arma_fit$arma[1], arma_fit$arma[2], "\n")
+summary(arma_fit)
+```
+**Key observations:**
+An ARMA(0,2) model (i.e., ARIMA(0,0,2) with a non-zero mean) was selected for 
+the BTC log-returns, meaning returns are modeled as a constant mean plus a 
+moving-average component driven by shocks from the previous two days. The 
+estimated mean return is 0.1456% (s.e. 0.0585), while the MA coefficients are
+small (ma1 = −0.0282, s.e. 0.0165; ma2 = 0.0302, s.e. 0.0163), suggesting only 
+weak short-run dependence in the return series. Model fit statistics are 
+AIC = 19589.5 (AICc = 19589.51) and BIC = 19614.31, with estimated innovation 
+variance σ² = 12.47 (log-likelihood −9790.75). On the training set, forecast 
+errors are RMSE = 3.53 and MAE = 2.30, and the residual autocorrelation at lag 1
+is essentially zero (ACF1 ≈ 0.00008), indicating the model leaves little linear
+autocorrelation in the mean process.
+
+
+## Model 2: GARCH — Volatility Modeling
+
+### ARCH Test (Pre-condition)
+
+```{r arch-test}
+# ARCH test: H0 = no ARCH effects
+cat("ARCH Test on raw BTC returns:\n")
+ArchTest(as.numeric(btc_ret), lags = 12)
+```
+
+**Interpretation:** A significant ARCH test (p < 0.05) confirms volatility 
+clustering — large shocks tend to be followed by large shocks. This validates
+fitting a GARCH model.
+
+### ARCH(1) — Benchmark Variance Model
+
+```{r arch1-fit}
+spec_arch <- ugarchspec(
+  variance.model     = list(model = "sGARCH", garchOrder = c(1, 0)),
+  mean.model         = list(armaOrder = c(0, 2), include.mean = TRUE),
+  distribution.model = "norm"
+)
+
+fit_arch <- ugarchfit(spec = spec_arch, data = btc_ret)
+show(fit_arch)
+```
+
+```{r arch1-diagnostics}
+z_arch <- residuals(fit_arch, standardize = TRUE)
+
+cat("Ljung-Box on standardized residuals (serial correlation):\n")
+print(Box.test(as.numeric(z_arch), lag = 20, type = "Ljung-Box"))
+
+cat("\nARCH test on standardized residuals (remaining ARCH effects):\n")
+print(ArchTest(as.numeric(z_arch), lags = 12))
+
+Acf(as.numeric(z_arch)^2,
+    main = "ACF of Squared Std Residuals — ARCH(1)\n(should be insignificant if adequate)")
+```
+**Interpretation:**
+The Ljung–Box test on standardized residuals strongly rejects the null 
+hypothesis of no serial correlation (p < 2.2e-16), indicating that some linear
+dependence remains in the residuals and the mean specification may not fully 
+capture all temporal dynamics. However, the ARCH LM test on standardized
+residuals yields a p-value of 1, suggesting that the GARCH component 
+successfully removes remaining ARCH effects and adequately models conditional 
+heteroskedasticity.
+
+### GARCH(1,1) — Full Volatility Model
+
+```{r garch11-fit}
+spec_garch <- ugarchspec(
+  variance.model     = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model         = list(armaOrder = c(0, 2), include.mean = TRUE),
+  distribution.model = "std"   # Student-t to handle heavy tails
+)
+
+fit_garch <- ugarchfit(spec_garch, data = btc_ret)
+show(fit_garch)
+```
+
+```{r garch11-diagnostics}
+z_garch <- residuals(fit_garch, standardize = TRUE)
+
+cat("Ljung-Box on standardized residuals:\n")
+print(Box.test(as.numeric(z_garch), lag = 20, type = "Ljung-Box"))
+
+cat("\nARCH test on standardized residuals:\n")
+print(ArchTest(as.numeric(z_garch), lags = 12))
+
+Acf(as.numeric(z_garch)^2,
+    main = "ACF of Squared Std Residuals — GARCH(1,1)\n(should be insignificant if adequate)")
+```
+
+**Interpretation:**
+Compared with the earlier ARCH specification, the GARCH model provides a better 
+overall fit. In the ARCH model, the Ljung–Box test on standardized residuals 
+produced an extremely small p-value (p < 2.2e-16), indicating strong remaining
+serial correlation and suggesting that the model did not adequately capture the 
+underlying dynamics of the series. In the GARCH model, the Ljung–Box statistic 
+is less small (p = 0.00136), showing that the remaining autocorrelation is
+substantially reduced. Additionally, the ARCH LM test yields a high p-value 
+(p = 0.8575), meaning we fail to reject the null hypothesis of no remaining ARCH
+effects. This indicates that the GARCH specification successfully captures 
+volatility clustering and improves the overall modeling of the conditional 
+variance relative to the simpler ARCH model.
+
+**Justification for GARCH(1,1) over ARCH(1):**
+- The ARCH(1) model only allows one lag of squared residuals to drive current 
+variance
+- The GARCH(1,1) adds a lagged variance term, providing a longer "memory" of 
+past volatility — well-suited for the persistent volatility clusters observed in
+BTC
+- Student-t distribution captures heavy tails better than Gaussian
+
+
+
+## Model 3: VAR — Multivariate Mean Forecasting
+
+VAR models the joint dynamics of all 7 stationary series, allowing each 
+variable's past values to help predict BTC returns. This tests H2 (macro Granger
+causality).
+
+### Visualize Training Series
+
+```{r var-eda-plot}
+tmp_df   <- data.frame(Date = index(train_xts), coredata(train_xts))
+tmp_long <- reshape2::melt(tmp_df, id.vars = "Date",
+                           variable.name = "Series", value.name = "Value")
+
+ggplot(tmp_long, aes(x = Date, y = Value)) +
+  geom_line(alpha = 0.6, color = "steelblue") +
+  facet_wrap(~Series, scales = "free_y", ncol = 1) +
+  theme_minimal() +
+  labs(title = "All VAR Input Series — Training Set",
+       subtitle = "All series are stationary (differenced or log-differenced)",
+       x = "Date", y = "")
+```
+
+### ACF / PACF
+
+```{r var-acf-pacf}
+par(mfrow = c(2, 1))
+Acf(var_df$rBTC,  lag.max = 60, main = "ACF: rBTC")
+Pacf(var_df$rBTC, lag.max = 60, main = "PACF: rBTC")
+par(mfrow = c(1, 1))
+```
+
+### Cross-Correlation (Predictors → BTC)
+
+```{r var-ccf}
+par(mfrow = c(3, 2))
+for (xnm in setdiff(colnames(var_df), "rBTC")) {
+  ccf(as.numeric(var_df[, xnm]), as.numeric(var_df$rBTC),
+      lag.max = 60,
+      main    = paste("CCF:", xnm, "→ rBTC"),
+      ylab    = "Cross-correlation")
+}
+par(mfrow = c(1, 1))
+```
+
+**Interpretation:** 
+The cross-correlation function (CCF) plots examine whether lagged values of 
+financial and macroeconomic variables contain predictive information for Bitcoin
+returns. Most correlations remain within the 95% confidence bounds, indicating 
+that the lead-lag relationships between BTC returns and variables such as SPY,
+QQQ, interest rates, inflation, and unemployment are generally weak. A few 
+isolated spikes appear at certain lags, particularly for unemployment and 
+inflation, suggesting occasional delayed associations, but no consistent pattern
+emerges across the predictors. Overall, the CCF analysis suggests that Bitcoin
+returns exhibit limited short-term dependence on these external variables, 
+although they may still contribute to the multivariate dynamics captured in the
+subsequent VAR modeling framework.
+
+### Lag Order Selection
+
+```{r var-lag-order}
+ord <- VARorder(train_Y, maxp = 10, output = TRUE)
+
+p <- ord$aicor[1]  # AIC-selected lag order
+cat("AIC-selected lag order p =", p, "\n")
+```
+
+### Granger Causality Tests
+
+```{r granger-tests}
+cat("Pairwise Granger Causality Tests (alpha = 0.05)\n")
+cat("H0: predictor does NOT Granger-cause rBTC\n\n")
+
+alpha <- 0.05
+for (cause_var in setdiff(colnames(train_xts), "rBTC")) {
+  formula_obj <- as.formula(paste("rBTC ~", cause_var))
+  test_result <- grangertest(formula_obj, order = p, data = train_xts)
+  pval        <- test_result$`Pr(>F)`[2]
+  verdict     <- if (pval < alpha) "GRANGER-CAUSES" else "does NOT cause"
+
+  cat(sprintf("%-6s -> rBTC: F = %6.3f, p = %7.4f => %s\n",
+              cause_var, test_result$F[2], pval, verdict))
+}
+```
+**Interpretation:**
+These results report pairwise Granger causality tests evaluating whether other 
+financial and macroeconomic variables help predict Bitcoin returns (rBTC). The 
+null hypothesis for each test is that the predictor does not Granger-cause rBTC,
+meaning that its past values do not provide additional predictive information 
+beyond the past values of Bitcoin returns themselves. Using a significance level 
+of α = 0.05, all p-values are well above 0.05. This means we fail to reject the 
+null hypothesis for every predictor, including equity market returns and 
+macroeconomic variables. In other words, based on this test and the selected lag
+structure, none of these variables provide statistically significant predictive
+power for Bitcoin returns. This result suggests that BTC returns are largely 
+driven by their own past dynamics rather than short-term spillovers from 
+traditional financial markets or macroeconomic indicators, which is consistent 
+with the weak lead–lag relationships observed in the earlier cross-correlation
+analysis. Nonetheless, we will fit VAR to confirm this.
+
+### VAR Model Fit
+
+```{r var-fit, echo=TRUE, results='hide'}
+var_fit <- MTS::VAR(train_Y, p = p, include.mean = TRUE)
+
+cat("Residual Covariance Matrix (Sigma):\n")
+print(round(var_fit$Sigma, 6))
+```
+
+### VAR Residual Diagnostics
+
+```{r var-mq-test}
+# Multivariate Ljung-Box (Portmanteau) test on VAR residuals
+mq(var_fit$residuals, lag = 10)
+```
+**Interpretation:**
+The Ljung–Box test results evaluate whether there is remaining serial 
+correlation in the residuals of the fitted VAR model. The null hypothesis of the
+test is that the residuals are independently distributed (no autocorrelation) up
+to lag m. Across all tested lags from m=1 to m=10, the reported p-values are 
+equal to 1, which are far above the 0.05 significance threshold. This means we 
+fail to reject the null hypothesis at every lag, indicating that there is no 
+evidence of residual autocorrelation remaining in the model errors. The 
+accompanying plot confirms this result, as all p-values lie well above the 
+significance boundary (blue dashed line). Overall, these diagnostics suggest 
+that the VAR model with the selected lag structure adequately captures the 
+temporal dependencies in the data, leaving residuals that behave approximately
+like white noise, which is a desirable property for a well-specified time series
+model. This is reflected below in the residuals plot below as well. 
+
+```{r var-residual-plots}
+residuals_var <- var_fit$residuals
+colnames(residuals_var) <- colnames(train_Y)
+
+par(mfrow = c(4, 2), mar = c(2, 3, 2, 1))
+for (i in 1:7) {
+  plot(residuals_var[, i], type = "l",
+       main = paste("VAR Residuals:", colnames(residuals_var)[i]),
+       ylab = "", xlab = "")
+  abline(h = 0, lty = 2, col = "red")
+}
+par(mfrow = c(1, 1))
+```
+
+```{r var-residual-qq}
+par(mfrow = c(4, 2), mar = c(2, 3, 2, 1))
+for (i in 1:7) {
+  qqnorm(residuals_var[, i],
+         main = paste("QQ Plot:", colnames(residuals_var)[i]))
+  qqline(residuals_var[, i], col = "red")
+}
+par(mfrow = c(1, 1))
+```
+**Interpretation:**
+The QQ plots show the distribution of the VAR model residuals for each variable 
+compared with a theoretical normal distribution. If the residuals were perfectly
+normal, the points would lie along the red reference line. While the residuals 
+for most variables align closely with the line in the center of the distribution, 
+several plots exhibit noticeable deviations in the tails, particularly for BTC 
+and equity return residuals, where extreme observations fall away from the line. 
+This indicates the presence of heavy tails and occasional outliers, meaning the 
+residuals are not perfectly normally distributed. However, the relatively good 
+alignment in the middle suggests the model captures the main dynamics of the 
+series reasonably well, while the tail deviations reflect the well-known
+tendency of financial returns to produce extreme shocks more frequently than a 
+normal distribution would predict.
+
+### VAR Multi-Step Forecast (Test Set)
+
+```{r var-multistep-forecast, echo=TRUE, results='hide'}
+h <- nrow(test_Y)
+
+# h-step ahead forecast from end of training
+fc       <- VARpred(var_fit, h = h)
+pred_mat <- fc$pred
+colnames(pred_mat) <- colnames(train_Y)
+
+actual_rBTC <- test_Y[, "rBTC"]
+pred_rBTC   <- pred_mat[, "rBTC"]
+
+rmse_var <- sqrt(mean((actual_rBTC - pred_rBTC)^2))
+mae_var  <- mean(abs(actual_rBTC - pred_rBTC))
+```
+
+```{r var-accuracy}
+cat("VAR Multi-Step Forecast Accuracy (rBTC):\n")
+cat(sprintf("  RMSE: %.4f\n  MAE:  %.4f\n", rmse_var, mae_var))
+```
+
+
+## Model 4: VAR + GARCH — Rolling 1-Step Forecast
+
+Multi-step VAR forecasts degrade quickly as errors compound. The rolling 
+1-step-ahead approach re-estimates both the VAR (mean) and GARCH (variance) at 
+each time step, using all data available up to that point.
+
+### Static VAR + GARCH Diagnostics
+
+```{r var-garch-static}
+# Re-fit VAR on full training set
+var_fit <- MTS::VAR(train_Y, p = p, include.mean = TRUE)
+colnames(var_fit$residuals) <- colnames(train_Y)
+
+resid_BTC <- na.omit(as.numeric(var_fit$residuals[, "rBTC"]))
+
+cat("ARCH Test on VAR residuals (BTC equation):\n")
+ArchTest(resid_BTC, lags = 12)
+
+spec_var_garch <- ugarchspec(
+  variance.model     = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model         = list(armaOrder = c(0, 0), include.mean = FALSE),
+  distribution.model = "std"
+)
+
+fit_var_garch <- ugarchfit(spec = spec_var_garch, data = resid_BTC)
+show(fit_var_garch)
+
+z_vg <- residuals(fit_var_garch, standardize = TRUE)
+cat("\nLjung-Box on VAR+GARCH standardized residuals:\n")
+print(Box.test(as.numeric(z_vg), lag = 20, type = "Ljung-Box"))
+cat("\nARCH test on VAR+GARCH standardized residuals:\n")
+print(ArchTest(as.numeric(z_vg), lags = 12))
+
+Acf(as.numeric(z_vg)^2,
+    main = "ACF: Squared Std Residuals (VAR+GARCH)\n(should be insignificant if adequate)")
+```
+**Interpretation:**
+The Ljung–Box test on the standardized residuals has a p-value of 0.141, so we
+fail to reject the null hypothesis of no autocorrelation in the residuals. This 
+suggests that the VAR model adequately captures the mean dynamics of the series. 
+In addition, the ARCH LM test yields a p-value of 0.85, meaning we also fail to 
+reject the null hypothesis of no remaining ARCH effects. This indicates that the 
+GARCH(1,1) specification has successfully captured the volatility clustering in
+the residuals. The squared residual ACF plot supports this conclusion, as it 
+shows no significant spikes. Overall, these diagnostics suggest that the static 
+VAR + GARCH specification is reasonably well specified, with residuals that
+behave approximately like white noise.
+
+### Rolling 1-Step-Ahead Evaluation
+
+```{r var-garch-rolling, message=FALSE, warning=FALSE, echo=TRUE, results='hide'}
+h <- nrow(test_Y)
+
+pred_mean_rBTC  <- rep(NA, h)
+pred_sigma_rBTC <- rep(NA, h)
+
+rolling_Y <- train_Y
+
+for (i in 1:h) {
+  # 1) Fit VAR on expanding window
+  var_i <- MTS::VAR(rolling_Y, p = p, include.mean = TRUE)
+
+  # 2) 1-step mean forecast
+  fc_i     <- VARpred(var_i, h = 1)
+  pred_vec <- fc_i$pred
+  pred_mat1 <- if (is.null(dim(pred_vec))) matrix(pred_vec, nrow = 1) else as.matrix(pred_vec)
+  colnames(pred_mat1) <- colnames(rolling_Y)
+
+  pred_mean_rBTC[i] <- as.numeric(pred_mat1[1, "rBTC"])
+
+  # 3) GARCH(1,1) on BTC residuals from VAR
+  res_mat <- var_i$residuals
+  if (is.null(colnames(res_mat))) colnames(res_mat) <- colnames(rolling_Y)
+
+  resid_BTC_i <- na.omit(as.numeric(res_mat[, "rBTC"]))
+  garch_i     <- ugarchfit(spec = spec_var_garch, data = resid_BTC_i, solver = "hybrid")
+  gfc_i       <- ugarchforecast(garch_i, n.ahead = 1)
+
+  pred_sigma_rBTC[i] <- as.numeric(sigma(gfc_i)[1])
+
+  # 4) Expand window with actual observation
+  rolling_Y <- rbind(rolling_Y, test_Y[i, ])
+}
+
+actual_rBTC <- as.numeric(test_Y[, "rBTC"])
+
+rmse_rolling <- sqrt(mean((actual_rBTC - pred_mean_rBTC)^2))
+mae_rolling  <- mean(abs(actual_rBTC - pred_mean_rBTC))
+
+cat("Rolling 1-Step VAR+GARCH Forecast Accuracy (rBTC):\n")
+cat(sprintf("  RMSE: %.4f\n  MAE:  %.4f\n", rmse_rolling, mae_rolling))
+
+vol_rmse <- sqrt(mean((actual_rBTC^2 - pred_sigma_rBTC^2)^2))
+cat(sprintf("  Volatility proxy RMSE (r² vs σ²): %.4f\n", vol_rmse))
+```
+
+**Interpretation:**
+In the rolling 1-step-ahead VAR+GARCH evaluation, the VAR model fit on the 
+expanding training window shows strong overall in-sample fit with information 
+criteria values of AIC = −21.03, BIC = −20.28, and HQ = −20.77, which are 
+primarily useful for comparing alternative lag specifications. The forecast 
+output reports the one-step-ahead predicted means for each variable at the 
+forecast origin, with associated prediction uncertainty: BTC has much larger 
+forecast standard error and RMSE (SE ≈ 3.51, RMSE ≈ 3.54) than SPY/QQQ and the 
+macro series, reflecting BTC’s substantially higher intrinsic volatility. 
+Out-of-sample performance for the key target, Bitcoin returns, is summarized by 
+the rolling forecast accuracy metrics: the VAR+GARCH framework achieves an RMSE 
+of 1.93 and MAE of 1.45 for rBTC, indicating that the average one-day-ahead 
+forecast error is about 1.45 percentage points. Finally, the volatility proxy 
+RMSE comparing realized squared returns r^2 to the GARCH-implied variance σ^2 is
+6.62, highlighting that while the model captures time-varying volatility, 
+realized volatility remains noisy and difficult to predict precisely at the 
+daily horizon.
+
+
+## Model 5: SARIMA — Univariate Log-Price Baseline
+
+SARIMA serves as a principled univariate baseline for log-price (level)
+forecasting.Weekly seasonality (frequency = 7) is specified to capture 
+day-of-week patterns in BTC trading volume and price.
+
+```{r sarima-data}
+btc_log   <- log(daily_data$BTC)
+btc_log   <- btc_log[!is.na(btc_log)]
+
+btc_train <- btc_log[index(btc_log) < test_start]
+btc_test  <- btc_log[index(btc_log) >= test_start]
+
+cat("SARIMA Train: n =", length(btc_train), "\n")
+cat("SARIMA Test:  n =", length(btc_test),  "\n")
+```
+
+```{r sarima-fit}
+y_train <- ts(as.numeric(btc_train), frequency = 7)
+y_test  <- ts(as.numeric(btc_test),  frequency = 7)
+
+fit_sarima <- auto.arima(y_train, seasonal = TRUE)
+summary(fit_sarima)
+
+h           <- length(y_test)
+fc_sarima   <- forecast(fit_sarima, h = h)
+```
+
+```{r sarima-accuracy}
+rmse_sarima <- sqrt(mean((as.numeric(y_test) - as.numeric(fc_sarima$mean))^2))
+mae_sarima  <- mean(abs(as.numeric(y_test)   - as.numeric(fc_sarima$mean)))
+
+cat("SARIMA Forecast Accuracy (log-price scale):\n")
+cat(sprintf("  RMSE: %.4f\n  MAE:  %.4f\n", rmse_sarima, mae_sarima))
+```
+
+**Note:** SARIMA RMSE/MAE are on the **log-price scale**, not the returns scale.
+They are not directly comparable to VAR+GARCH metrics, which are on the returns
+scale. We use log prices for the SARIMA model because ARIMA-type models 
+typically require the series to be non-stationary in levels but stationary after
+differencing, and taking the log stabilizes variance and allows the model to 
+capture price trends and proportional changes more effectively. In contrast, the
+VAR+GARCH framework is designed to model stationary return series and 
+time-varying volatility. 
+
+
+**Interpretation:**
+The SARIMA model fitted to the log Bitcoin price series is an SARIMA(0,1,2) with 
+drift, meaning the series is first-differenced to remove nonstationarity while 
+two moving-average terms capture short-term shocks and the drift term represents 
+a small underlying upward trend in the log price. The estimated MA coefficients 
+(−0.0293 and 0.0316) are relatively small, suggesting that only modest short-run 
+error dependence exists after differencing. The model achieves strong in-sample 
+fit, with a low residual variance (σ² ≈ 0.0013) and information criteria values 
+of AIC = −13077.23 and BIC = −13052.66. Training error metrics are also small 
+(RMSE ≈ 0.036, MAE ≈ 0.0236), and the near-zero ACF1 of the residuals indicates 
+little remaining autocorrelation, suggesting the model captures most of the 
+serial structure in the differenced log-price series. When evaluated on the test 
+set, the model produces an out-of-sample forecast RMSE of 0.2416 and MAE of 
+0.1665 on the log-price scale, indicating reasonable predictive accuracy for 
+short-term Bitcoin price movements.
+
+
+## Model 6: BSTS — Bayesian Structural Time Series
+
+BSTS decomposes log-price into trend + seasonal + regression components. Unlike 
+SARIMA, BSTS explicitly models the structural components and incorporates 
+macroeconomic regressors with spike-and-slab priors that perform automatic
+variable selection.
+
+```{r bsts-data}
+X <- var_df[, c("rSPY","rQQQ","dFF","dGS10","dCPI","dUNR")]
+
+# Align log-BTC with predictor dates
+y <- btc_log[index(btc_log) %in% index(X)]
+X <- X[index(X) %in% index(y)]
+stopifnot(all(index(y) == index(X)))
+
+y_train_b <- as.numeric(y[index(y) < test_start])
+y_test_b  <- as.numeric(y[index(y) >= test_start])
+
+X_train <- as.matrix(X[index(X) < test_start])
+X_test  <- as.matrix(X[index(X) >= test_start])
+
+cat("BSTS Train n =", length(y_train_b), " | Test n =", length(y_test_b), "\n")
+```
+
+```{r bsts-fit, message=FALSE}
+ss <- list()
+ss <- AddLocalLevel(ss,   y_train_b)
+ss <- AddSeasonal(ss,     y_train_b, nseasons = 7)
+
+set.seed(123)
+fit_bsts <- bsts(
+  formula             = y_train_b ~ X_train,
+  state.specification = ss,
+  niter               = 2000,
+  ping                = 0
+)
+
+summary(fit_bsts)
+plot(fit_bsts, main = "BSTS: State Components + Coefficient Posteriors")
+```
+
+```{r bsts-forecast}
+pred_bsts     <- predict(fit_bsts, newdata = X_test)
+pred_log_bsts <- as.numeric(pred_bsts$mean)
+
+rmse_bsts <- sqrt(mean((y_test_b - pred_log_bsts)^2))
+mae_bsts  <- mean(abs(y_test_b  - pred_log_bsts))
+
+cat("BSTS Forecast Accuracy (log-price scale):\n")
+cat(sprintf("  RMSE: %.4f\n  MAE:  %.4f\n", rmse_bsts, mae_bsts))
+```
+**Interpretation:**
+The BSTS model produces out-of-sample forecast errors of RMSE = 0.1056 and 
+MAE = 0.0901 on the log-price scale, indicating relatively strong predictive 
+performance for Bitcoin prices. Compared to the SARIMA model (RMSE = 0.2416, 
+MAE = 0.1665), the BSTS approach yields substantially lower forecast errors, 
+suggesting that incorporating a Bayesian structural framework with latent trend 
+components better captures the underlying dynamics of the log-price series. 
+Because BSTS models explicitly decompose the series into components such as 
+trend, noise, and potentially seasonal or regression effects, they can adapt 
+more flexibly to structural changes in the data, which is particularly useful 
+for highly volatile assets like Bitcoin. As with the SARIMA model, these 
+accuracy metrics are measured on the log-price scale, meaning they are not 
+directly comparable to the VAR+GARCH results, which are evaluated on the 
+returns scale. We don't use log returns because BSTS deomposes a series into 
+latent components including trend. 
+
+
+
+# Results
+
+## Plot Helper Functions
+
+```{r plot-helpers}
+# ── Unified forecast plot (any scale) ─────────────────────────────────────────
+plot_forecast <- function(dates, actual, predicted, title,
+                          y_label = "Value", rmse = NULL, mae = NULL) {
+  subtitle_txt <- if (!is.null(rmse) && !is.null(mae))
+    paste0("Test period  |  RMSE = ", round(rmse, 2), "  |  MAE = ", round(mae, 2))
+  else ""
+
+  df <- data.frame(Date = dates, Actual = actual, Predicted = predicted)
+  df_long <- reshape2::melt(df, id.vars = "Date",
+                            variable.name = "Series", value.name = "Value")
+
+  ggplot(df_long, aes(x = Date, y = Value, colour = Series)) +
+    geom_line(linewidth = 0.85, alpha = 0.85) +
+    scale_colour_manual(values = c("Actual" = "#2166ac", "Predicted" = "#d6604d")) +
+    scale_y_continuous(labels = scales::comma) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "top",
+          plot.subtitle    = element_text(size = 10, colour = "grey40"),
+          panel.grid.minor = element_blank()) +
+    labs(title = title, subtitle = subtitle_txt,
+         x = "Date", y = y_label, colour = "")
+}
+
+# ── Convert VAR/GARCH return forecasts → USD price ────────────────────────────
+# Starting from last_price, chain: P_t = P_{t-1} * exp(r_t / 100)
+returns_to_price <- function(returns_pct, last_price) {
+  prices <- numeric(length(returns_pct))
+  prices[1] <- last_price * exp(returns_pct[1] / 100)
+  for (i in seq_along(returns_pct)[-1])
+    prices[i] <- prices[i - 1] * exp(returns_pct[i] / 100)
+  prices
+}
+```
+
+## Actual BTC Price Plots — All Models (USD Scale)
+
+All four models are converted to **USD price** for direct visual comparison.
+
+- **VAR / VAR+GARCH:** return forecasts are compounded forward from the last training
+  price using `P_t = P_{t-1} × exp(r_t / 100)`.
+- **SARIMA / BSTS:** log-price forecasts are back-transformed with `exp(·)`.
+
+RMSE and MAE in the subtitles are also on the **USD scale**, making them directly
+comparable across all models for the first time.
+
+```{r usd-prep}
+# Last known BTC price at end of training window
+last_train_price <- as.numeric(tail(daily_data$BTC[index(daily_data$BTC) < test_start], 1))
+cat("Last training price (USD):", scales::dollar(last_train_price), "\n")
+
+# Actual BTC price during the test window
+test_dates_btc <- index(daily_data$BTC[index(daily_data$BTC) >= test_start])
+actual_usd     <- as.numeric(daily_data$BTC[index(daily_data$BTC) >= test_start])
+
+# ── VAR multi-step → USD ──────────────────────────────────────────────────────
+var_dates      <- index(test_xts)
+pred_usd_var   <- returns_to_price(as.numeric(pred_mat[, "rBTC"]), last_train_price)
+actual_usd_var <- as.numeric(daily_data$BTC[as.character(var_dates)])
+
+rmse_usd_var <- sqrt(mean((actual_usd_var - pred_usd_var)^2, na.rm = TRUE))
+mae_usd_var  <- mean(abs(actual_usd_var  - pred_usd_var),    na.rm = TRUE)
+
+# ── VAR+GARCH rolling → USD ───────────────────────────────────────────────────
+pred_usd_vg   <- returns_to_price(pred_mean_rBTC, last_train_price)
+actual_usd_vg <- actual_usd_var   # same test dates
+
+rmse_usd_vg <- sqrt(mean((actual_usd_vg - pred_usd_vg)^2, na.rm = TRUE))
+mae_usd_vg  <- mean(abs(actual_usd_vg  - pred_usd_vg),    na.rm = TRUE)
+
+# ── SARIMA → USD (exp of log-price forecast) ──────────────────────────────────
+sarima_dates   <- as.Date(index(btc_test))
+pred_usd_sar   <- exp(as.numeric(fc_sarima$mean))
+actual_usd_sar <- exp(as.numeric(btc_test))
+
+rmse_usd_sar <- sqrt(mean((actual_usd_sar - pred_usd_sar)^2, na.rm = TRUE))
+mae_usd_sar  <- mean(abs(actual_usd_sar  - pred_usd_sar),    na.rm = TRUE)
+
+# ── BSTS → USD (exp of log-price forecast) ───────────────────────────────────
+bsts_dates    <- index(X[index(X) >= test_start])
+pred_usd_bsts <- exp(pred_log_bsts)
+actual_usd_bsts <- exp(y_test_b)
+
+rmse_usd_bsts <- sqrt(mean((actual_usd_bsts - pred_usd_bsts)^2, na.rm = TRUE))
+mae_usd_bsts  <- mean(abs(actual_usd_bsts  - pred_usd_bsts),    na.rm = TRUE)
+```
+
+### Model 3: VAR — Multi-Step Ahead (USD)
+
+```{r plot-var-usd}
+plot_forecast(
+  dates     = var_dates,
+  actual    = actual_usd_var,
+  predicted = pred_usd_var,
+  title     = "Model 3: VAR — Multi-Step Ahead",
+  y_label   = "BTC Price (USD)",
+  rmse      = rmse_usd_var,
+  mae       = mae_usd_var
+)
+```
+
+### Model 4: VAR+GARCH — Rolling 1-Step Ahead (USD)
+
+```{r plot-vargarch-usd}
+plot_forecast(
+  dates     = var_dates,
+  actual    = actual_usd_vg,
+  predicted = pred_usd_vg,
+  title     = "Model 4: VAR+GARCH — Rolling 1-Step Ahead",
+  y_label   = "BTC Price (USD)",
+  rmse      = rmse_usd_vg,
+  mae       = mae_usd_vg
+)
+```
+
+### Model 5: SARIMA (USD)
+
+```{r plot-sarima-usd}
+plot_forecast(
+  dates     = sarima_dates,
+  actual    = actual_usd_sar,
+  predicted = pred_usd_sar,
+  title     = "Model 5: SARIMA",
+  y_label   = "BTC Price (USD)",
+  rmse      = rmse_usd_sar,
+  mae       = mae_usd_sar
+)
+```
+
+### Model 6: BSTS (USD)
+
+```{r plot-bsts-usd}
+plot_forecast(
+  dates     = bsts_dates,
+  actual    = actual_usd_bsts,
+  predicted = pred_usd_bsts,
+  title     = "Model 6: BSTS",
+  y_label   = "BTC Price (USD)",
+  rmse      = rmse_usd_bsts,
+  mae       = mae_usd_bsts
+)
+```
+
+
+
+## Side-by-Side Panel: All Models (USD)
+
+All four models on the same USD price axis for direct comparison.
+
+```{r panel-usd-var, fig.height=6}
+# ── Slide 1: VAR & VAR+GARCH ─────────────────────────────────────────────────
+panel_var <- bind_rows(
+  data.frame(Date      = var_dates,
+             Actual    = actual_usd_var,
+             Predicted = pred_usd_var,
+             Model     = sprintf("VAR Multi-Step  |  RMSE=$%s  |  MAE=$%s",
+                                 format(round(rmse_usd_var), big.mark = ","),
+                                 format(round(mae_usd_var),  big.mark = ","))),
+  data.frame(Date      = var_dates,
+             Actual    = actual_usd_vg,
+             Predicted = pred_usd_vg,
+             Model     = sprintf("VAR+GARCH Rolling  |  RMSE=$%s  |  MAE=$%s",
+                                 format(round(rmse_usd_vg), big.mark = ","),
+                                 format(round(mae_usd_vg),  big.mark = ",")))
+)
+panel_var$Model <- factor(panel_var$Model, levels = unique(panel_var$Model))
+
+panel_var_long <- reshape2::melt(panel_var, id.vars = c("Date", "Model"),
+                                 variable.name = "Series", value.name = "USD")
+
+ggplot(panel_var_long, aes(x = Date, y = USD, colour = Series)) +
+  geom_line(linewidth = 0.8, alpha = 0.85) +
+  facet_wrap(~Model, ncol = 2, scales = "fixed") +
+  scale_colour_manual(values = c("Actual" = "#2166ac", "Predicted" = "#d6604d")) +
+  scale_y_continuous(labels = scales::dollar) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position  = "top",
+        strip.text        = element_text(face = "bold", size = 11),
+        panel.grid.minor  = element_blank()) +
+  labs(title    = "VAR Models: Actual vs. Predicted BTC Price (USD)",
+       subtitle = "Test period: June 2025 – January 2026",
+       x = "Date", y = "BTC Price (USD)", colour = "")
+```
+
+```{r panel-usd-logprice, fig.height=6}
+# ── Slide 2: SARIMA & BSTS ───────────────────────────────────────────────────
+panel_lp <- bind_rows(
+  data.frame(Date      = sarima_dates,
+             Actual    = actual_usd_sar,
+             Predicted = pred_usd_sar,
+             Model     = sprintf("SARIMA  |  RMSE=$%s  |  MAE=$%s",
+                                 format(round(rmse_usd_sar), big.mark = ","),
+                                 format(round(mae_usd_sar),  big.mark = ","))),
+  data.frame(Date      = as.Date(bsts_dates),
+             Actual    = actual_usd_bsts,
+             Predicted = pred_usd_bsts,
+             Model     = sprintf("BSTS  |  RMSE=$%s  |  MAE=$%s",
+                                 format(round(rmse_usd_bsts), big.mark = ","),
+                                 format(round(mae_usd_bsts),  big.mark = ",")))
+)
+panel_lp$Model <- factor(panel_lp$Model, levels = unique(panel_lp$Model))
+
+panel_lp_long <- reshape2::melt(panel_lp, id.vars = c("Date", "Model"),
+                                variable.name = "Series", value.name = "USD")
+
+ggplot(panel_lp_long, aes(x = Date, y = USD, colour = Series)) +
+  geom_line(linewidth = 0.8, alpha = 0.85) +
+  facet_wrap(~Model, ncol = 2, scales = "fixed") +
+  scale_colour_manual(values = c("Actual" = "#2166ac", "Predicted" = "#d6604d")) +
+  scale_y_continuous(labels = scales::dollar) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position  = "top",
+        strip.text        = element_text(face = "bold", size = 11),
+        panel.grid.minor  = element_blank()) +
+  labs(title    = "Log-Price Models: Actual vs. Predicted BTC Price (USD)",
+       subtitle = "Test period: June 2025 – January 2026",
+       x = "Date", y = "BTC Price (USD)", colour = "")
+```
+
+
+
+## Model Comparison Summary
+
+```{r model-comparison}
+# USD-scale metrics are directly comparable across all models
+results_usd <- data.frame(
+  Model = c("VAR (multi-step)", "VAR+GARCH (rolling 1-step)", "SARIMA", "BSTS"),
+  Forecast_Scale = c("Returns → USD", "Returns → USD", "log-price → USD", "log-price → USD"),
+  RMSE_USD = paste0("$", format(round(c(rmse_usd_var, rmse_usd_vg, rmse_usd_sar, rmse_usd_bsts)), big.mark = ",")),
+  MAE_USD  = paste0("$", format(round(c(mae_usd_var,  mae_usd_vg,  mae_usd_sar,  mae_usd_bsts)),  big.mark = ","))
+)
+
+print(results_usd)
+
+# Native-scale metrics (for reference / methodological discussion)
+cat("\n--- Native-scale metrics (for reference) ---\n")
+cat("Returns scale (VAR, VAR+GARCH):\n")
+print(data.frame(
+  Model = c("VAR (multi-step)", "VAR+GARCH (rolling 1-step)"),
+  RMSE  = round(c(rmse_var, rmse_rolling), 4),
+  MAE   = round(c(mae_var,  mae_rolling),  4)
+))
+
+cat("\nLog-price scale (SARIMA, BSTS):\n")
+print(data.frame(
+  Model = c("SARIMA", "BSTS"),
+  RMSE  = round(c(rmse_sarima, rmse_bsts), 4),
+  MAE   = round(c(mae_sarima,  mae_bsts),  4)
+))
+```
+
+## Key Findings
+
+- **H1 (ARCH effect): Accepted**
+The ARCH LM test on raw BTC returns (χ² = 115.36, p < 2.2e-16) confirms strong
+volatility clustering. ARCH(1) residuals retained significant ARCH effects
+(p = 6.6e-11), confirming it was insufficient. GARCH(1,1) with Student-t errors
+eliminated remaining effects (p = 0.856), better capturing heavy tails and
+persistent volatility.
+
+- **H2 (Macro linkage): Rejected**
+Pairwise Granger tests at α = 0.05 found no evidence that any of the six
+macro/market variables (rSPY, rQQQ, dFF, dGS10, dCPI, dUNR) improve forecasts
+of BTC returns beyond BTC's own lags (all p > 0.16). This suggests BTC is driven
+more by crypto-specific sentiment and liquidity than broader financial conditions,
+and limits the benefit of VAR and BSTS models whose strength depends on
+informative exogenous variables.
+
+- **H3 (Static VAR vs. Rolling VAR+GARCH): Rejected**
+The rolling 1-step-ahead VAR+GARCH (RMSE = 1.9296) marginally underperformed the
+static VAR multi-step forecast (RMSE = 1.8726) on the USD scale. The overhead of
+re-estimation did not compensate for the lack of predictive signal in the
+macro/market variables, consistent with the Granger causality results.
+
+- **H4 (BSTS flexibility): Accepted**
+On the log-price scale, BSTS (RMSE = 0.1060, MAE = 0.0914) outperformed SARIMA
+(RMSE = 0.2416, MAE = 0.1665) by ~56%. By jointly modeling latent trend,
+seasonality, and regression components with Bayesian variable selection, BSTS
+adapts to structural changes and captures slower-moving dynamics that a purely
+autoregressive SARIMA cannot.
+
+
+# Future Work
+
+1. **Richer Feature Set:**
+The rejection of H2 suggests the current macro variables lack predictive power
+over BTC returns. Future work could incorporate crypto-native features — on-chain
+metrics (hash rate, active addresses, exchange inflows), BTC options-implied
+volatility, and social media sentiment — which may better capture the speculative
+dynamics that drive BTC price movements.
+
+2. **Nonlinear and Deep Learning Models:**
+All models in this project assume linear dynamics in the mean equation. LSTM or
+Transformer-based models (e.g., Temporal Fusion Transformer) can capture
+nonlinear dependencies and long-range temporal patterns that VAR and SARIMA
+cannot, and are increasingly standard benchmarks in cryptocurrency forecasting.
+
+3. **Regime-Switching Models:**
+The 6-month test window (June 2025 – January 2026) spans a single market regime.
+A Markov-switching GARCH or threshold VAR could detect and adapt to structural
+shifts between bull and bear regimes, which are a defining feature of BTC's price
+history and a likely explanation for why static model parameters underperform.
+
+4. **Trading Strategy Backtesting:**
+Forecast accuracy metrics (RMSE, MAE) measure statistical performance but not
+economic value. Converting model forecasts into a long/short trading rule and
+evaluating risk-adjusted returns — Sharpe ratio, maximum drawdown, win rate —
+over the test period would directly address the original objective of identifying
+profitable trading opportunities.
